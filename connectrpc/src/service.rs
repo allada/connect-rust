@@ -1419,11 +1419,105 @@ impl Body for GrpcUnaryBody {
     }
 }
 
+/// Connect unary response body, emitted as one data frame per segment.
+///
+/// A segmented encode is a view response that captured its large borrowed
+/// fields by reference count instead of copying them. Such a body reaches the
+/// socket still segmented, rather than being flattened into one buffer on the
+/// way out. gRPC and gRPC-Web already did this via [`GrpcUnaryBody`]; this is
+/// the Connect equivalent, minus the envelope framing.
+///
+/// The total length is known up front, so `size_hint` stays exact and the
+/// response still carries a `Content-Length` rather than falling back to
+/// chunked transfer.
+pub struct UnaryBody {
+    segments: std::collections::VecDeque<Bytes>,
+    remaining: usize,
+}
+
+impl UnaryBody {
+    /// A body of one contiguous buffer.
+    fn single(bytes: Bytes) -> Self {
+        let remaining = bytes.len();
+        let mut segments = std::collections::VecDeque::with_capacity(1);
+        if !bytes.is_empty() {
+            segments.push_back(bytes);
+        }
+        Self {
+            segments,
+            remaining,
+        }
+    }
+
+    /// A body that keeps whatever segmentation the encoder produced.
+    fn from_encoded(body: crate::response::EncodedBody) -> Self {
+        let remaining = body.len();
+        let segments = match body {
+            crate::response::EncodedBody::Contiguous(b) => {
+                let mut q = std::collections::VecDeque::with_capacity(1);
+                if !b.is_empty() {
+                    q.push_back(b);
+                }
+                q
+            }
+            crate::response::EncodedBody::Segmented(v) => {
+                v.into_iter().filter(|s| !s.is_empty()).collect()
+            }
+        };
+        Self {
+            segments,
+            remaining,
+        }
+    }
+}
+
+/// Reports shape, never contents: a response body must not leak into logs.
+impl std::fmt::Debug for UnaryBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnaryBody")
+            .field("segments", &self.segments.len())
+            .field("remaining", &self.remaining)
+            .finish()
+    }
+}
+
+impl Body for UnaryBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let me = self.get_mut();
+        match me.segments.pop_front() {
+            Some(segment) => {
+                me.remaining = me.remaining.saturating_sub(segment.len());
+                Poll::Ready(Some(Ok(Frame::data(segment))))
+            }
+            None => Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining as u64)
+    }
+}
+
 /// Response body type that can be Connect unary, gRPC unary, or streaming.
 #[non_exhaustive]
 pub enum ConnectRpcBody {
     /// Connect protocol unary response (single `Full<Bytes>` body).
+    ///
+    /// Used for bodyless and error responses. Handler responses go through
+    /// [`ConnectRpcBody::Unary`], which can carry a segmented encode.
     Full(Full<Bytes>),
+    /// Connect protocol unary response that keeps the encoder's segments.
+    Unary(UnaryBody),
     /// gRPC/gRPC-Web unary response (data frame + trailers, no stream overhead).
     GrpcUnary(GrpcUnaryBody),
     /// Streaming response (server streaming, client streaming, bidi, or gRPC unary fallback).
@@ -1440,8 +1534,27 @@ impl Body for ConnectRpcBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.get_mut() {
             ConnectRpcBody::Full(inner) => Pin::new(inner).poll_frame(cx),
+            ConnectRpcBody::Unary(inner) => Pin::new(inner).poll_frame(cx),
             ConnectRpcBody::GrpcUnary(inner) => Pin::new(inner).poll_frame(cx),
             ConnectRpcBody::Streaming(inner) => Pin::new(inner).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            ConnectRpcBody::Full(inner) => inner.is_end_stream(),
+            ConnectRpcBody::Unary(inner) => inner.is_end_stream(),
+            ConnectRpcBody::GrpcUnary(inner) => inner.is_end_stream(),
+            ConnectRpcBody::Streaming(inner) => inner.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            ConnectRpcBody::Full(inner) => inner.size_hint(),
+            ConnectRpcBody::Unary(inner) => inner.size_hint(),
+            ConnectRpcBody::GrpcUnary(inner) => inner.size_hint(),
+            ConnectRpcBody::Streaming(inner) => inner.size_hint(),
         }
     }
 }
@@ -1561,7 +1674,7 @@ where
             interceptors,
         )
         .await
-        .map(|r| r.map(ConnectRpcBody::Full));
+        .map(|r| r.map(ConnectRpcBody::Unary));
     }
 
     // Content type didn't resolve to a known protocol+codec. A gRPC/gRPC-Web
@@ -1706,7 +1819,7 @@ where
                 interceptors,
             )
             .await
-            .map(|r| r.map(ConnectRpcBody::Full))
+            .map(|r| r.map(ConnectRpcBody::Unary))
         }
     }
 }
@@ -1800,7 +1913,7 @@ async fn handle_unary_request<D, B>(
     compression_policy: &CompressionPolicy,
     deadline_policy: &DeadlinePolicy,
     interceptors: &[Arc<dyn Interceptor>],
-) -> Result<Response<Full<Bytes>>, ConnectError>
+) -> Result<Response<UnaryBody>, ConnectError>
 where
     D: Dispatcher,
     B: Body<Data = Bytes> + Send + 'static,
@@ -1948,25 +2061,21 @@ where
 
     // Compress response body if negotiated, respecting the compression policy
     let effective_policy = compression_policy.with_override(resp.compress);
-    // Connect unary flattens. Compression needs one contiguous input, and the
-    // uncompressed case would need `Full<Bytes>` replaced with a multi-frame
-    // body to carry segments — Connect puts the message straight in the HTTP
-    // body, so nothing here splits it for us the way an envelope does. The
-    // segmented encode therefore reaches only gRPC and gRPC-Web unary.
-    // Flattening is a no-op unless the encoder segmented.
+    // Compression needs one contiguous input, so that path flattens. The
+    // uncompressed path keeps whatever segmentation the encoder produced and
+    // emits one body frame per segment, so a view response that captured its
+    // large fields by refcount is not copied back into a single buffer here.
     let body_len = resp.body.len();
-    let resp_body = resp.body.into_contiguous();
-    let (final_body, content_encoding) = if let Some(encoding) = response_encoding {
-        if effective_policy.should_compress(body_len) {
-            match compression.compress(encoding, &resp_body) {
-                Ok(compressed) => (compressed, Some(encoding)),
-                Err(_) => (resp_body, None), // Fall back to uncompressed
-            }
-        } else {
-            (resp_body, None)
+    let (final_body, content_encoding) = if let Some(encoding) = response_encoding
+        && effective_policy.should_compress(body_len)
+    {
+        let flat = resp.body.into_contiguous();
+        match compression.compress(encoding, &flat) {
+            Ok(compressed) => (UnaryBody::single(compressed), Some(encoding)),
+            Err(_) => (UnaryBody::single(flat), None), // Fall back to uncompressed
         }
     } else {
-        (resp_body, None)
+        (UnaryBody::from_encoded(resp.body), None)
     };
 
     // Build response with the same content type as the request
@@ -1993,7 +2102,7 @@ where
     let response = add_trailers(response, &resp.trailers);
 
     response
-        .body(Full::new(final_body))
+        .body(final_body)
         .map_err(|e| ConnectError::internal(format!("failed to build response: {e}")))
 }
 
@@ -4538,6 +4647,136 @@ mod tests {
 
     async fn body_bytes(body: ConnectRpcBody) -> Bytes {
         body.collect().await.unwrap().to_bytes()
+    }
+
+    /// Count the data frames a body emits, and collect them.
+    async fn body_frames<B>(body: B) -> Vec<Bytes>
+    where
+        B: Body<Data = Bytes>,
+        B::Error: std::fmt::Debug,
+    {
+        let mut body = std::pin::pin!(body);
+        let mut out = Vec::new();
+        while let Some(frame) = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
+            if let Ok(data) = frame.unwrap().into_data() {
+                out.push(data);
+            }
+        }
+        out
+    }
+
+    /// A segmented encode must reach the socket still segmented: one frame per
+    /// segment, each aliasing the encoder's buffer. Flattening here would undo
+    /// the whole point of capturing large fields by reference count.
+    #[tokio::test]
+    async fn unary_body_keeps_segments_uncopied() {
+        let big = Bytes::from(vec![7u8; 32 * 1024]);
+        let segments = vec![Bytes::from_static(b"head"), big.clone()];
+        let body = UnaryBody::from_encoded(crate::response::EncodedBody::Segmented(segments));
+
+        assert_eq!(body.size_hint().exact(), Some((4 + 32 * 1024) as u64));
+
+        let frames = body_frames(body).await;
+        assert_eq!(frames.len(), 2, "one frame per segment");
+        assert_eq!(&frames[0][..], b"head");
+        assert!(
+            std::ptr::addr_eq(frames[1].as_ptr(), big.as_ptr()),
+            "the large segment must be passed through, not copied"
+        );
+    }
+
+    /// End to end: a handler whose body encodes to segments must reach the
+    /// socket as separate frames, with the large segment passed through by
+    /// reference count. This is the property the change exists for; the
+    /// `UnaryBody` unit tests above only prove the type, not the wiring.
+    #[tokio::test]
+    async fn connect_unary_response_keeps_segments_uncopied() {
+        use buffa::Message as _;
+        use buffa_types::google::protobuf::StringValue;
+
+        /// Splits a real `StringValue` encoding in two, so concatenating the
+        /// segments is byte-identical to `encode`, as `Encodable` requires.
+        struct SplitBody {
+            whole: Bytes,
+            at: usize,
+        }
+
+        impl crate::response::Encodable<StringValue> for SplitBody {
+            fn encode(&self, _codec: CodecFormat) -> Result<Bytes, ConnectError> {
+                Ok(self.whole.clone())
+            }
+            fn encode_segments(
+                &self,
+                _codec: CodecFormat,
+            ) -> Result<crate::response::EncodedBody, ConnectError> {
+                Ok(crate::response::EncodedBody::Segmented(vec![
+                    self.whole.slice(..self.at),
+                    self.whole.slice(self.at..),
+                ]))
+            }
+        }
+
+        let whole: Bytes = StringValue {
+            value: "x".repeat(32 * 1024),
+            ..Default::default()
+        }
+        .encode_to_bytes();
+        let whole_ptr = whole.as_ptr() as usize;
+        let split_at = 16;
+
+        let router = Router::new().route(
+            "test.Svc",
+            "Echo",
+            crate::handler::handler_fn(move |_ctx, _req: StringValue| {
+                let whole = whole.clone();
+                async move {
+                    Ok(crate::response::Response::new(SplitBody {
+                        whole,
+                        at: split_at,
+                    }))
+                }
+            }),
+        );
+
+        let mut service = ConnectRpcService::new(router);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/test.Svc/Echo")
+            .header(header::CONTENT_TYPE, "application/proto")
+            .body(Full::new(Bytes::from(
+                StringValue::default().encode_to_vec(),
+            )))
+            .unwrap();
+
+        let response = tower::Service::call(&mut service, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let frames = body_frames(response.into_body()).await;
+        assert_eq!(frames.len(), 2, "segments must stay separate frames");
+        assert_eq!(frames[0].len(), split_at);
+        // The tail segment must still point into the handler's buffer.
+        let tail = frames[1].as_ptr() as usize;
+        assert_eq!(
+            tail,
+            whole_ptr + split_at,
+            "the large segment was copied instead of passed through"
+        );
+    }
+
+    /// A contiguous encode stays one frame, and an empty body emits none while
+    /// still reporting an exact zero length.
+    #[tokio::test]
+    async fn unary_body_contiguous_and_empty() {
+        let one = UnaryBody::from_encoded(crate::response::EncodedBody::Contiguous(
+            Bytes::from_static(b"hello"),
+        ));
+        assert_eq!(one.size_hint().exact(), Some(5));
+        assert_eq!(body_frames(one).await.len(), 1);
+
+        let empty = UnaryBody::from_encoded(crate::response::EncodedBody::Contiguous(Bytes::new()));
+        assert!(empty.is_end_stream());
+        assert_eq!(empty.size_hint().exact(), Some(0));
+        assert!(body_frames(empty).await.is_empty());
     }
 
     #[tokio::test]

@@ -1,0 +1,11 @@
+kind: Changed
+body: |-
+  **Connect unary responses no longer flatten a segmented encode.** A view
+  response that captured its large borrowed fields by reference count now
+  reaches the socket as one body frame per segment, matching what gRPC and
+  gRPC-Web unary already did. Previously the Connect path copied every segment
+  back into a single buffer on the way out, so the protocol paid a full-body
+  copy that gRPC did not. Compressed responses still flatten, since the
+  compressor needs one contiguous input. `Content-Length` is unchanged: the
+  new `UnaryBody` reports an exact size hint.
+time: 2026-08-02T04:00:00.000000000Z
